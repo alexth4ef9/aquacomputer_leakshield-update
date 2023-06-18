@@ -1,0 +1,8 @@
+[Unit]
+Description=Leakshield update service
+
+[Service]
+ExecStart=/usr/local/bin/aquacomputer-leakshield -v
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,171 @@
+#!/usr/bin/python3
+# SPDX-FileCopyrightText: 2023, Alexander Thulcke
+# SPDX-License-Identifier: MIT
+
+from os import path
+from glob import glob
+from signal import signal, SIGTERM
+from argparse import ArgumentParser
+from time import time, sleep
+import sys
+import logging
+
+
+args = None
+logger = None
+
+
+class aquacomputer:
+    def __init__(self, name):
+        self.path = None
+        self.pump = None
+        self.flow = None
+        hwmon = '/sys/class/hwmon'
+        for entry in glob('hwmon*', root_dir=hwmon):
+            namefile = path.join(hwmon, entry, 'name')
+            if path.exists(namefile):
+                with open(namefile, 'r') as f:
+                    if f.read().strip() == name:
+                        self.path = path.join(hwmon, entry)
+                        logger.info('found "{0}" at "{1}"'.format(name, entry))
+                        break
+
+    def findentry(self, name):
+        if not self.path:
+            return None
+        for entry in glob('fan*_label', root_dir=self.path):
+            with open(path.join(self.path, entry), 'r') as f:
+                if f.read().lower().startswith(name.lower()):
+                    inputname = entry.replace('_label', '_input')
+                    logger.info('found "{0}" at "{1}/{2}"'.format(name, path.basename(self.path), inputname))
+                    return path.join(self.path, inputname)
+
+
+class aquaero(aquacomputer):
+    def __init__(self, pump, flow):
+        aquacomputer.__init__(self, 'aquaero')
+        self.pump = aquacomputer.findentry(self, 'fan {0} speed'.format(pump))
+        self.flow = aquacomputer.findentry(self, 'flow sensor {0}'.format(flow))
+
+    def getPump(self):
+        with open(self.pump, 'r') as f:
+            return f.read().strip()
+
+    def getFlow(self):
+        with open(self.flow, 'r') as f:
+            return f.read().strip()
+
+
+class leakshield(aquacomputer):
+    def __init__(self, aq):
+        aquacomputer.__init__(self, 'leakshield')
+        self.pump = aquacomputer.findentry(self, 'user-provided pump speed')
+        self.flow = aquacomputer.findentry(self, 'user-provided flow')
+        self.aquaero = aq
+        self.n = 0
+
+    def setPumpFlow(self):
+        if self.n == 0:
+            pump = self.aquaero.getPump()
+            logger.debug('pump at {0} RPM'.format(pump))
+            with open(self.pump, 'w') as f:
+                f.write(pump + '\n')
+            self.n = 1
+        else:
+            flow = self.aquaero.getFlow()
+            logger.debug('flow at {0} l/h'.format(float(flow) / 10))
+            with open(self.flow, 'w') as f:
+                f.write(flow + '\n')
+            self.n = 0
+
+
+def parse_args():
+    global args, logger
+
+    parser = ArgumentParser(description='aquacomputer leakshield update service')
+    default_pump = 1
+    default_flow = 1
+
+    parser.add_argument(
+        '-p', '--pump',
+        help='pump fan entry (default: {0})'.format(default_pump),
+        type=int, choices=range(1,5), default=default_pump)
+    parser.add_argument(
+        '-f', '--flow',
+        help='flow sensor entry (default: {0})'.format(default_flow),
+        type=int, choices=range(1,3), default=default_flow)
+    parser.add_argument(
+        '-v', '--verbose',
+        help='increase verbosity',
+        action='count', default=0)
+    parser.add_argument(
+        '-s', '--shortlog',
+        help='log only level and message',
+        action='store_true')
+
+    args = parser.parse_args()
+
+    if args.verbose == 1:
+        log_level = logging.INFO
+    elif args.verbose > 1:
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.WARNING
+
+    if args.shortlog:
+        fmt = '%(levelname)s: %(message)s'
+    else:
+        fmt = ('%(asctime)s:%(name)s %(levelname)s(pid %(process)d): '
+               '%(message)s')
+
+    logging.basicConfig(level=log_level, format=fmt)
+    logger = logging.getLogger('aquacomputer-leakshield')
+
+
+def sigterm_handler(signum, frame):
+    if signum == SIGTERM:
+        logger.info('received SIGTERM, tearing down')
+        # implictely raise SystemExit to cleanup properly
+        sys.exit(0)
+
+
+def main():
+    parse_args()
+
+    aq = aquaero(args.pump, args.flow)
+    shield = leakshield(aq)
+
+    signal(SIGTERM, sigterm_handler)
+
+    try:
+        status_interval = 10
+        nextstatus = time() + status_interval // 2
+        while True:
+            try:
+                now = time()
+                wait = nextstatus - now
+                if wait > 0:
+                    logger.debug('waiting for {0} seconds'.format(wait))
+                    sleep(wait)
+                try:
+                    try:
+                        shield.setPumpFlow()
+                    except (TypeError, FileNotFoundError, IOError):
+                        aq = aquaero(args.pump, args.flow)
+                        shield = leakshield(aq)
+                finally:
+                    now = time()
+                nextstatus += status_interval
+            except (SystemExit, KeyboardInterrupt):
+                # silently exit the loop
+                logger.debug('got termination signal')
+                break
+            except Exception:
+                logger.exception('error in main loop')
+    finally:
+        logger.info('shutting down gracefully...')
+    logger.info('done')
+
+
+if __name__ == '__main__':
+    main()
